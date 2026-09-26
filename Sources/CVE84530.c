@@ -19,7 +19,7 @@ extern int proc_pidfdinfo(int pid, int fd, int flavor, void *buf, int bufsz);
 
 static char g_result[2048];
 
-uint64_t cve_84530_leak)void) {
+uint64_t cve_84530_leak(void) {
 
     const char *home = getenv("HOME");
     if (!home) home = "/tmp";
