@@ -1,0 +1,21 @@
+name: POC84530
+options:
+  bundleIdPrefix: com.research
+  deploymentTarget:
+    iOS: "16.0"
+targets:
+  POC84530:
+    type: application
+    platform: iOS
+    sources:
+      - path: Sources
+    info:
+      path: Sources/Info.plist
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.research.poc84530
+        SWIFT_VERSION: "5.9"
+        SWIFT_OBJC_BRIDGING_HEADER: Sources/Bridging.h
+        IPHONEOS_DEPLOYMENT_TARGET: "16.0"
+        ENABLE_BITCODE: NO
+        TARGETED_DEVICE_FAMILY: "1,2"

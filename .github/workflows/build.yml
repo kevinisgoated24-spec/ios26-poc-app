@@ -1,0 +1,40 @@
+name: Build IPA
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode_15.4.app
+      - name: Install xcodegen
+        run: brew install xcodegen
+      - name: Generate project
+        run: xcodegen generate
+      - name: Build unsigned IPA
+        run: |
+          xcodebuild \
+            -project POC84530.xcodeproj \
+            -scheme POC84530 \
+            -sdk iphoneos \
+            -configuration Release \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            DEVELOPMENT_TEAM="" \
+            -derivedDataPath DerivedData \
+            build
+      - name: Package IPA
+        run: |
+          mkdir -p Payload
+          cp -r DerivedData/Build/Products/Release-iphoneos/POC84530.app Payload/
+          zip -r POC84530-unsigned.ipa Payload/
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: POC84530-unsigned
+          path: POC84530-unsigned.ipa
+          retention-days: 7
